@@ -8,7 +8,10 @@ patch, renames the original to hyperhv.dll.bak, then installs the patched file
 as hyperhv.dll. It will not overwrite an existing backup. If the DLL is already
 patched, it reports that and makes no changes unless test signing was selected.
 For an already-patched DLL, test signing saves the unsigned patched copy as
-`hyperhv.dll.unsigned.bak` before installing the signed version.
+`hyperhv.dll.unsigned.bak` before installing the signed version. The GUI's Undo
+button restores the original from its `<name>.dll.bak` file and preserves the
+currently installed patched DLL as `hyperhv.dll.patched.bak`. It will not
+overwrite either file.
 
 Command-line use:
 
@@ -24,23 +27,22 @@ Optional test signing: select "Test-sign for other PCs" in the GUI, or add
 `--test-sign` on the command line. Signing is built into the
 EXE through Windows cryptography APIs; Visual Studio, the WDK, and SignTool are
 not required. The patcher creates a temporary self-signed test certificate,
-embeds a SHA-256 Authenticode signature, exports the public certificate as a
-`HyperHV-TestCert-<fingerprint>.cer` beside the DLL, then deletes the temporary
-private signing key. This is for local testing, not production signing. Because
-the key is temporary, signing another DLL creates a new certificate and a new
-`.cer` file.
-
-To test the same signed DLL on another PC, copy both `hyperhv.dll` and its
-matching `.cer` file to that PC. For Windows kernel-mode test signing, import
-the `.cer` into the test PC's Local Machine Trusted Root Certification
-Authorities store (and Trusted Publishers if the installation flow requires
-it), enable test-signing from an elevated command prompt with
+embeds a SHA-256 Authenticode signature, then deletes the temporary private
+signing key. It does not export a `.cer` file: the certificate is embedded in
+the signed DLL, and Windows test mode does not require the certificate to chain
+to a trusted root. This is for testing, not production signing. On each test PC,
+enable test-signing from an elevated command prompt with
 `bcdedit /set testsigning on`, then restart Windows. The patcher does not change
 boot settings or certificate trust stores. Test mode may be blocked by Secure
 Boot policy; Microsoft documents the test-signing requirements and setup at
-https://learn.microsoft.com/en-us/windows-hardware/drivers/install/the-testsigning-boot-configuration-option
-and
-https://learn.microsoft.com/en-us/windows-hardware/drivers/install/installing-test-certificates.
+https://learn.microsoft.com/en-us/windows-hardware/drivers/install/the-testsigning-boot-configuration-option.
+
+To undo from the GUI, choose **Undo (select .bak)** and select the original
+backup, such as `hyperhv.dll.bak`. The original DLL is restored to its original
+filename. The installed `hyperhv.dll` is retained as `hyperhv.dll.patched.bak`.
+Command-line undo is also available:
+
+  HyperHvDllPatcher.exe --undo hyperhv.dll.bak
 
 The scanner identifies imports, helper routines, the EPT table field at offset
 0x228, the allocator call, and exactly two matching free calls. It proceeds only

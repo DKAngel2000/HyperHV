@@ -411,8 +411,8 @@ static bool EncodeCertExtension(LPCSTR oid,BOOL critical,LPCSTR structureType,co
     extension.pszObjId=const_cast<LPSTR>(oid);extension.fCritical=critical;
     extension.Value.cbData=size;extension.Value.pbData=encoded.data();return true;
 }
-static void DeleteTemporaryTestKey(const std::wstring& container){
-    HCRYPTPROV provider=0;CryptAcquireContextW(&provider,container.c_str(),MS_ENH_RSA_AES_PROV_W,PROV_RSA_AES,CRYPT_DELETEKEYSET);
+static bool DeleteTemporaryTestKey(const std::wstring& container){
+    HCRYPTPROV provider=0;return CryptAcquireContextW(&provider,container.c_str(),MS_ENH_RSA_AES_PROV_W,PROV_RSA_AES,CRYPT_DELETEKEYSET)!=FALSE;
 }
 static PCCERT_CONTEXT CreateTestCertificate(std::wstring& container,std::string& error){
     const wchar_t* subjectText=L"CN=HyperHV Local Test Signing";
@@ -520,7 +520,8 @@ static bool InstallWithBackup(const fs::path& input,const Bytes& original,const 
         if(!cert){DeleteFileW(staged.c_str());return false;}
         bool signedOk=SignWithTestCertificate(staged,cert,error);
         bool exported=signedOk&&ExportPublicTestCertificate(cert,target.parent_path(),publicCert,error);
-        CertFreeCertificateContext(cert);DeleteTemporaryTestKey(keyContainer);
+        CertFreeCertificateContext(cert);bool keyRemoved=DeleteTemporaryTestKey(keyContainer);
+        if(signedOk&&exported&&!keyRemoved){DeleteFileW(staged.c_str());error="Windows could not remove the temporary private signing key; the patched DLL was not installed.";return false;}
         if(!signedOk||!exported){DeleteFileW(staged.c_str());return false;}
     }
     if(!MoveFileExW(absoluteInput.c_str(),backup.c_str(),MOVEFILE_WRITE_THROUGH)){
@@ -551,7 +552,8 @@ static bool SignAlreadyPatched(const fs::path& input,const Bytes& bytes,fs::path
     if(!cert){DeleteFileW(staged.c_str());return false;}
     bool signedOk=SignWithTestCertificate(staged,cert,error);
     bool exported=signedOk&&ExportPublicTestCertificate(cert,target.parent_path(),publicCert,error);
-    CertFreeCertificateContext(cert);DeleteTemporaryTestKey(keyContainer);
+    CertFreeCertificateContext(cert);bool keyRemoved=DeleteTemporaryTestKey(keyContainer);
+    if(signedOk&&exported&&!keyRemoved){DeleteFileW(staged.c_str());error="Windows could not remove the temporary private signing key; the patched DLL was not installed.";return false;}
     if(!signedOk||!exported){DeleteFileW(staged.c_str());return false;}
     if(!MoveFileExW(absoluteInput.c_str(),unsignedBackup.c_str(),MOVEFILE_WRITE_THROUGH)){
         DeleteFileW(staged.c_str());error="Could not preserve the unsigned patched DLL before signing.";return false;

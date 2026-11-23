@@ -29,13 +29,14 @@ The EXE does not require PowerShell, Ghidra, internet access, or a separate
 runtime installation. It is built with the C++ runtime linked in. The C++ source
 is included beside it for inspection and future maintenance.
 
-Patch behavior (based on ept-identity-table-noncontiguous.diff): the EPT
-identity-table allocation call is redirected from MmAllocateContiguousMemory
-to the DLL's pool-allocation helper (which uses ExAllocatePoolWithTag). Its two
-matching cleanup calls are redirected from MmFreeContiguousMemory to the
-pool-free helper (which uses ExFreePoolWithTag). The change applies only to
-those EPT table paths; other contiguous-memory allocations, including VMXON
-and VMCS regions, are left alone. The tool does not load the DLL. Digital
+Reference diff: ept-identity-table-noncontiguous.diff is included in the
+repository. It changes EPT table allocation from
+PlatformMemAllocateContiguousZeroedMemory to PlatformMemAllocateZeroedNonPagedPool,
+and the two matching cleanup calls from MmFreeContiguousMemory to
+PlatformMemFreePool. The binary patcher applies the corresponding compiled
+changes only to those EPT table paths; other contiguous-memory allocations,
+including VMXON and VMCS regions, are left alone. The diff is for reference; the
+EXE does not read it at runtime. The tool does not load the DLL. Digital
 signatures are not checked or preserved; changing code may invalidate one.
 
 Exit codes: 0 success/already patched, 2 input error, 3 unsupported layout,

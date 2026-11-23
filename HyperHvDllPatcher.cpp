@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <commdlg.h>
 #include <commctrl.h>
+#include <wincrypt.h>
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -18,6 +19,8 @@
 
 #pragma comment(lib, "Comdlg32.lib")
 #pragma comment(lib, "Comctl32.lib")
+#pragma comment(lib, "Crypt32.lib")
+#pragma comment(lib, "Advapi32.lib")
 
 namespace fs = std::filesystem;
 using Bytes = std::vector<uint8_t>;
@@ -390,6 +393,100 @@ static std::optional<std::string> MatchPatchedProfile(const Bytes& bytes){
     return std::nullopt;
 }
 
+struct SignerFileInfoLocal { DWORD cbSize; LPCWSTR fileName; HANDLE file; };
+struct SignerSubjectInfoLocal { DWORD cbSize; DWORD* index; DWORD choice; union { SignerFileInfoLocal* fileInfo; void* blobInfo; }; };
+struct SignerCertStoreInfoLocal { DWORD cbSize; PCCERT_CONTEXT cert; DWORD policy; HCERTSTORE store; };
+struct SignerCertLocal { DWORD cbSize; DWORD choice; union { LPCWSTR spcFile; SignerCertStoreInfoLocal* storeInfo; void* chainInfo; }; HWND window; };
+struct SignerSignatureInfoLocal { DWORD cbSize; ALG_ID hashAlgorithm; DWORD attributesChoice; union { void* authCodeAttributes; }; PCRYPT_ATTRIBUTES authenticated; PCRYPT_ATTRIBUTES unauthenticated; };
+struct SignerContextLocal;
+using SignerSignExLocal = HRESULT (WINAPI*)(DWORD,SignerSubjectInfoLocal*,SignerCertLocal*,SignerSignatureInfoLocal*,void*,LPCWSTR,PCRYPT_ATTRIBUTES,LPVOID,SignerContextLocal**);
+using SignerFreeContextLocal = HRESULT (WINAPI*)(SignerContextLocal*);
+
+static bool EncodeCertExtension(LPCSTR oid,BOOL critical,LPCSTR structureType,const void* value,CERT_EXTENSION& extension,Bytes& encoded){
+    DWORD size=0;
+    if(!CryptEncodeObjectEx(X509_ASN_ENCODING,structureType,value,0,nullptr,nullptr,&size)||!size)return false;
+    encoded.resize(size);
+    if(!CryptEncodeObjectEx(X509_ASN_ENCODING,structureType,value,0,nullptr,encoded.data(),&size))return false;
+    encoded.resize(size);
+    extension.pszObjId=const_cast<LPSTR>(oid);extension.fCritical=critical;
+    extension.Value.cbData=size;extension.Value.pbData=encoded.data();return true;
+}
+static void DeleteTemporaryTestKey(const std::wstring& container){
+    HCRYPTPROV provider=0;CryptAcquireContextW(&provider,container.c_str(),MS_ENH_RSA_AES_PROV_W,PROV_RSA_AES,CRYPT_DELETEKEYSET);
+}
+static PCCERT_CONTEXT CreateTestCertificate(std::wstring& container,std::string& error){
+    const wchar_t* subjectText=L"CN=HyperHV Local Test Signing";
+    container=L"HyperHvTest-"+std::to_wstring(GetCurrentProcessId())+L"-"+std::to_wstring(GetTickCount64());
+    HCRYPTPROV provider=0;
+    if(!CryptAcquireContextW(&provider,container.c_str(),MS_ENH_RSA_AES_PROV_W,PROV_RSA_AES,CRYPT_NEWKEYSET)){
+        error="Could not create a temporary local test-signing key.";return nullptr;
+    }
+    HCRYPTKEY key=0;
+    if(!CryptGenKey(provider,AT_SIGNATURE,(2048u<<16),&key)){
+        CryptReleaseContext(provider,0);DeleteTemporaryTestKey(container);error="Could not generate the temporary test-signing key.";return nullptr;
+    }
+    CryptDestroyKey(key);
+
+    DWORD nameSize=0;
+    if(!CertStrToNameW(X509_ASN_ENCODING,subjectText,CERT_X500_NAME_STR,nullptr,nullptr,&nameSize,nullptr)||!nameSize){
+        CryptReleaseContext(provider,0);DeleteTemporaryTestKey(container);error="Could not encode the test-certificate name.";return nullptr;
+    }
+    Bytes name(nameSize);
+    if(!CertStrToNameW(X509_ASN_ENCODING,subjectText,CERT_X500_NAME_STR,nullptr,name.data(),&nameSize,nullptr)){
+        CryptReleaseContext(provider,0);DeleteTemporaryTestKey(container);error="Could not encode the test-certificate name.";return nullptr;
+    }
+    CERT_NAME_BLOB subject{nameSize,name.data()};
+    CERT_BASIC_CONSTRAINTS2_INFO basic{};basic.fCA=FALSE;
+    BYTE keyUsage=CERT_DIGITAL_SIGNATURE_KEY_USAGE;CRYPT_BIT_BLOB usage{1,&keyUsage,7};
+    LPSTR ekuOids[]={const_cast<LPSTR>("1.3.6.1.5.5.7.3.3")};CERT_ENHKEY_USAGE eku{1,ekuOids};
+    CERT_EXTENSION extensions[3]{};Bytes encBasic,encUsage,encEku;
+    if(!EncodeCertExtension(szOID_BASIC_CONSTRAINTS2,TRUE,X509_BASIC_CONSTRAINTS2,&basic,extensions[0],encBasic)||
+       !EncodeCertExtension(szOID_KEY_USAGE,TRUE,X509_KEY_USAGE,&usage,extensions[1],encUsage)||
+       !EncodeCertExtension(szOID_ENHANCED_KEY_USAGE,TRUE,X509_ENHANCED_KEY_USAGE,&eku,extensions[2],encEku)){
+        CryptReleaseContext(provider,0);DeleteTemporaryTestKey(container);error="Could not prepare test-certificate usage constraints.";return nullptr;
+    }
+    CERT_EXTENSIONS certExtensions{3,extensions};
+    CRYPT_KEY_PROV_INFO keyInfo{};keyInfo.pwszContainerName=container.data();keyInfo.pwszProvName=const_cast<LPWSTR>(MS_ENH_RSA_AES_PROV_W);
+    keyInfo.dwProvType=PROV_RSA_AES;keyInfo.dwKeySpec=AT_SIGNATURE;
+    CRYPT_ALGORITHM_IDENTIFIER signatureAlgorithm{};signatureAlgorithm.pszObjId=const_cast<LPSTR>(szOID_RSA_SHA256RSA);
+    SYSTEMTIME endTime{};GetSystemTime(&endTime);endTime.wYear=static_cast<WORD>(endTime.wYear+5);
+    PCCERT_CONTEXT created=CertCreateSelfSignCertificate(provider,&subject,0,&keyInfo,&signatureAlgorithm,nullptr,&endTime,&certExtensions);
+    CryptReleaseContext(provider,0);
+    if(!created){DeleteTemporaryTestKey(container);error="Windows could not create the local test certificate.";return nullptr;}
+    return created;
+}
+static bool ExportPublicTestCertificate(PCCERT_CONTEXT cert,const fs::path& folder,fs::path& output,std::string& error){
+    BYTE hash[64]{};DWORD hashSize=sizeof(hash);
+    if(!CertGetCertificateContextProperty(cert,CERT_SHA1_HASH_PROP_ID,hash,&hashSize)){error="Could not read the test certificate fingerprint.";return false;}
+    static const wchar_t digits[]=L"0123456789ABCDEF";std::wstring fingerprint;fingerprint.reserve(hashSize*2);
+    for(DWORD i=0;i<hashSize;i++){fingerprint.push_back(digits[hash[i]>>4]);fingerprint.push_back(digits[hash[i]&15]);}
+    output=folder/(L"HyperHV-TestCert-"+fingerprint+L".cer");
+    HANDLE file=CreateFileW(output.c_str(),GENERIC_WRITE,0,nullptr,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,nullptr);
+    if(file==INVALID_HANDLE_VALUE){
+        if(GetLastError()==ERROR_FILE_EXISTS){std::ifstream in(output,std::ios::binary);Bytes onDisk((std::istreambuf_iterator<char>(in)),std::istreambuf_iterator<char>());
+            if(onDisk.size()==cert->cbCertEncoded&&std::memcmp(onDisk.data(),cert->pbCertEncoded,cert->cbCertEncoded)==0)return true;
+            error="An existing public certificate file does not match this test certificate.";return false;}
+        error="Could not create the public test certificate file.";return false;
+    }
+    DWORD written=0;BOOL ok=WriteFile(file,cert->pbCertEncoded,cert->cbCertEncoded,&written,nullptr)&&written==cert->cbCertEncoded;CloseHandle(file);
+    if(!ok){DeleteFileW(output.c_str());error="Failed while exporting the public test certificate.";return false;}
+    return true;
+}
+static bool SignWithTestCertificate(const fs::path& file,PCCERT_CONTEXT cert,std::string& error){
+    HMODULE module=LoadLibraryW(L"mssign32.dll");if(!module){error="This Windows installation does not provide the built-in Authenticode signing API.";return false;}
+    auto sign=reinterpret_cast<SignerSignExLocal>(GetProcAddress(module,"SignerSignEx"));
+    auto freeContext=reinterpret_cast<SignerFreeContextLocal>(GetProcAddress(module,"SignerFreeSignerContext"));
+    if(!sign){FreeLibrary(module);error="The built-in Authenticode signing API is unavailable.";return false;}
+    std::wstring path=file.wstring();SignerFileInfoLocal fileInfo{sizeof(fileInfo),path.c_str(),nullptr};DWORD index=0;
+    SignerSubjectInfoLocal subject{sizeof(subject),&index,1,{}};subject.fileInfo=&fileInfo;
+    SignerCertStoreInfoLocal certStoreInfo{sizeof(certStoreInfo),cert,2,nullptr};SignerCertLocal signerCert{sizeof(signerCert),2,{}};signerCert.storeInfo=&certStoreInfo;
+    SignerSignatureInfoLocal signatureInfo{};signatureInfo.cbSize=sizeof(signatureInfo);signatureInfo.hashAlgorithm=CALG_SHA_256;signatureInfo.attributesChoice=0;
+    SignerContextLocal* context=nullptr;HRESULT result=sign(0,&subject,&signerCert,&signatureInfo,nullptr,nullptr,nullptr,nullptr,&context);
+    if(context&&freeContext)freeContext(context);FreeLibrary(module);
+    if(FAILED(result)){error="Windows Authenticode signing failed (HRESULT "+std::to_string(static_cast<uint32_t>(result))+").";return false;}
+    return true;
+}
+
 static bool WritePatchedCopy(const fs::path& input,const fs::path& output,const Bytes& original,const Profile& profile,std::string& error){
     if(fs::absolute(input).wstring()==fs::absolute(output).wstring()){error="Choose a different output path; the input is never overwritten.";return false;}
     if(fs::exists(output)){error="Output already exists; choose a new path.";return false;}
@@ -404,7 +501,7 @@ static bool WritePatchedCopy(const fs::path& input,const fs::path& output,const 
     if(!ok){DeleteFileW(output.c_str());error="Failed while writing the patched DLL.";return false;}
     return true;
 }
-static bool InstallWithBackup(const fs::path& input,const Bytes& original,const Profile& profile,fs::path& finalDll,fs::path& backup,std::string& error){
+static bool InstallWithBackup(const fs::path& input,const Bytes& original,const Profile& profile,bool testSign,fs::path& finalDll,fs::path& backup,fs::path& publicCert,std::string& error){
     std::error_code ec;
     const fs::path absoluteInput=fs::absolute(input,ec).lexically_normal();
     if(ec){error="Could not resolve the input path.";return false;}
@@ -416,8 +513,16 @@ static bool InstallWithBackup(const fs::path& input,const Bytes& original,const 
     if(fs::exists(backup)){error="Backup already exists; no files were changed: "+backup.string();return false;}
     if(fs::exists(target)&&!samePath(target,absoluteInput)){error="A different hyperhv.dll already exists beside the input; no files were changed: "+target.string();return false;}
     finalDll=target;
-    fs::path staged=target.parent_path()/(L".hyperhv.patching."+std::to_wstring(GetCurrentProcessId())+L".tmp");
+    fs::path staged=target.parent_path()/(L".hyperhv.patching."+std::to_wstring(GetCurrentProcessId())+L".dll");
     if(!WritePatchedCopy(input,staged,original,profile,error))return false;
+    if(testSign){
+        std::wstring keyContainer;PCCERT_CONTEXT cert=CreateTestCertificate(keyContainer,error);
+        if(!cert){DeleteFileW(staged.c_str());return false;}
+        bool signedOk=SignWithTestCertificate(staged,cert,error);
+        bool exported=signedOk&&ExportPublicTestCertificate(cert,target.parent_path(),publicCert,error);
+        CertFreeCertificateContext(cert);DeleteTemporaryTestKey(keyContainer);
+        if(!signedOk||!exported){DeleteFileW(staged.c_str());return false;}
+    }
     if(!MoveFileExW(absoluteInput.c_str(),backup.c_str(),MOVEFILE_WRITE_THROUGH)){
         DeleteFileW(staged.c_str());error="Could not rename the original to its backup; no replacement was installed.";return false;
     }
@@ -428,6 +533,33 @@ static bool InstallWithBackup(const fs::path& input,const Bytes& original,const 
         }else{
             error="Could not install the patched DLL, and automatic restore failed. Original backup is at "+backup.string()+"; staged patch is at "+staged.string()+" (Windows error "+std::to_string(installError)+").";
         }
+        return false;
+    }
+    return true;
+}
+static bool SignAlreadyPatched(const fs::path& input,const Bytes& bytes,fs::path& finalDll,fs::path& unsignedBackup,fs::path& publicCert,std::string& error){
+    std::error_code ec;const fs::path absoluteInput=fs::absolute(input,ec).lexically_normal();
+    if(ec){error="Could not resolve the input path.";return false;}
+    const fs::path target=absoluteInput.parent_path()/L"hyperhv.dll";
+    auto samePath=[](const fs::path& a,const fs::path& b){return CompareStringOrdinal(a.c_str(),-1,b.c_str(),-1,TRUE)==CSTR_EQUAL;};
+    if(fs::exists(target)&&!samePath(target,absoluteInput)){error="A different hyperhv.dll already exists beside the selected patched DLL.";return false;}
+    unsignedBackup=fs::path(absoluteInput.wstring()+L".unsigned.bak");
+    if(fs::exists(unsignedBackup)){error="Unsigned backup already exists; no files were changed: "+unsignedBackup.string();return false;}
+    finalDll=target;fs::path staged=target.parent_path()/(L".hyperhv.signing."+std::to_wstring(GetCurrentProcessId())+L".dll");
+    Profile noChanges{};if(!WritePatchedCopy(input,staged,bytes,noChanges,error))return false;
+    std::wstring keyContainer;PCCERT_CONTEXT cert=CreateTestCertificate(keyContainer,error);
+    if(!cert){DeleteFileW(staged.c_str());return false;}
+    bool signedOk=SignWithTestCertificate(staged,cert,error);
+    bool exported=signedOk&&ExportPublicTestCertificate(cert,target.parent_path(),publicCert,error);
+    CertFreeCertificateContext(cert);DeleteTemporaryTestKey(keyContainer);
+    if(!signedOk||!exported){DeleteFileW(staged.c_str());return false;}
+    if(!MoveFileExW(absoluteInput.c_str(),unsignedBackup.c_str(),MOVEFILE_WRITE_THROUGH)){
+        DeleteFileW(staged.c_str());error="Could not preserve the unsigned patched DLL before signing.";return false;
+    }
+    if(!MoveFileExW(staged.c_str(),target.c_str(),MOVEFILE_WRITE_THROUGH)){
+        if(MoveFileExW(unsignedBackup.c_str(),absoluteInput.c_str(),MOVEFILE_WRITE_THROUGH)){
+            DeleteFileW(staged.c_str());error="Could not install the test-signed DLL. The previous DLL was restored.";
+        }else error="Could not install the test-signed DLL or restore the previous DLL. The unsigned backup is at "+unsignedBackup.string()+" and staged file is at "+staged.string()+".";
         return false;
     }
     return true;
@@ -447,8 +579,8 @@ static std::optional<fs::path> PickOutput(const fs::path& input){
 }
 
 static int Run(const std::vector<std::wstring>& args,bool guiMode=false){
-    bool experimental=false,scanOnly=false;std::vector<std::wstring> positional;
-    for(const auto& a:args){if(a==L"--experimental")experimental=true;else if(a==L"--scan-only")scanOnly=true;else if(a==L"--help"||a==L"-h"){std::wcout<<L"HyperHvDllPatcher [--experimental] <hyperhv.dll>\nThe original is backed up as <input>.bak and the patched file is installed as hyperhv.dll.\n";return 0;}else positional.push_back(a);}
+    bool experimental=false,scanOnly=false,testSign=false;std::vector<std::wstring> positional;
+    for(const auto& a:args){if(a==L"--experimental")experimental=true;else if(a==L"--scan-only")scanOnly=true;else if(a==L"--test-sign")testSign=true;else if(a==L"--help"||a==L"-h"){std::wcout<<L"HyperHvDllPatcher [--experimental] [--test-sign] <hyperhv.dll>\nThe original is backed up as <input>.bak and the patched file is installed as hyperhv.dll.\n";return 0;}else positional.push_back(a);}
     if(positional.size()>1){std::wcerr<<L"Supply one input DLL. The patcher installs the result as hyperhv.dll and saves the original as <input>.bak.\n";return 2;}
     const bool gui=guiMode||positional.empty();
     fs::path input;
@@ -457,25 +589,33 @@ static int Run(const std::vector<std::wstring>& args,bool guiMode=false){
     Bytes bytes((std::istreambuf_iterator<char>(in)),std::istreambuf_iterator<char>());in.close();if(bytes.empty()){std::wcerr<<L"Input DLL is empty.\n";return 2;}
 
     if(scanOnly){Profile p{};bool already=false;std::string error;if(!FindExperimental(bytes,p,already,error)){std::cerr<<"SCAN REFUSED: "<<error<<"\n";return 3;}for(const auto& x:p.patches)std::cout<<x.label<<" offset=0x"<<std::hex<<x.offset<<" before="<<Hex(x.before)<<" after="<<Hex(x.after)<<"\n";return 0;}
+    auto handleAlreadyPatched=[&](const std::string& label){
+        if(!testSign){std::string m="Already patched: "+label+". No output was written.";if(gui)MessageBoxA(nullptr,m.c_str(),"Already patched",MB_OK|MB_ICONINFORMATION);else std::cout<<m<<"\n";return 0;}
+        fs::path finalDll,unsignedBackup,publicCert;std::string signError;
+        if(!SignAlreadyPatched(input,bytes,finalDll,unsignedBackup,publicCert,signError)){if(gui)MessageBoxA(nullptr,signError.c_str(),"Test signing failed",MB_OK|MB_ICONERROR);else std::cerr<<signError<<"\n";return 5;}
+        std::string m="Already patched: "+label+". Added a test signature. Unsigned patched backup: "+unsignedBackup.string()+". Installed as: "+finalDll.string()+". Public certificate: "+publicCert.string()+". Copy the .cer to each test PC and enable test-signing mode there.";
+        if(gui)MessageBoxA(nullptr,m.c_str(),"Test signature added",MB_OK|MB_ICONWARNING);else std::cout<<m<<"\n";return 0;
+    };
     auto original=MatchOriginalProfile(bytes);
-    if(!original){auto done=MatchPatchedProfile(bytes);if(done){std::string m="Already patched: "+*done+". No output was written.";if(gui)MessageBoxA(nullptr,m.c_str(),"Already patched",MB_OK|MB_ICONINFORMATION);else std::cout<<m<<"\n";return 0;}}
+    if(!original){auto done=MatchPatchedProfile(bytes);if(done)return handleAlreadyPatched(*done);}
     Profile profile{};
     if(original)profile=*original;
     else {
         if(!experimental&&!gui){std::string m="Unsupported hyperhv.dll layout. No bytes were changed. Retry with --experimental to request the conservative built-in scan.";std::cerr<<m<<"\n";return 3;}
         if(gui && MessageBoxW(nullptr,L"This DLL is not one of the reviewed builds. Try the experimental internal PE/x64 scan? It refuses ambiguous matches. The original will be backed up before replacement.",L"Experimental mode",MB_YESNO|MB_ICONWARNING)!=IDYES)return 0;
         bool already=false;std::string error;if(!FindExperimental(bytes,profile,already,error)){std::string m="Experimental scan refused to patch: "+error+" No bytes were changed.";if(gui)MessageBoxA(nullptr,m.c_str(),"Experimental scan refused",MB_OK|MB_ICONWARNING);else std::cerr<<m<<"\n";return 4;}
-        if(already){std::string m="Already patched: experimental EPT layout. No output was written.";if(gui)MessageBoxA(nullptr,m.c_str(),"Already patched",MB_OK|MB_ICONINFORMATION);else std::cout<<m<<"\n";return 0;}
+        if(already)return handleAlreadyPatched("experimental EPT layout");
     }
-    fs::path output,backup;
-    std::string error;if(!InstallWithBackup(input,bytes,profile,output,backup,error)){if(gui)MessageBoxA(nullptr,error.c_str(),"Patch not installed",MB_OK|MB_ICONERROR);else std::cerr<<error<<"\n";return 5;}
+    fs::path output,backup,publicCert;
+    std::string error;if(!InstallWithBackup(input,bytes,profile,testSign,output,backup,publicCert,error)){if(gui)MessageBoxA(nullptr,error.c_str(),"Patch not installed",MB_OK|MB_ICONERROR);else std::cerr<<error<<"\n";return 5;}
     std::string message="Patched "+std::string(profile.name)+". Original backup: "+backup.string()+". Installed as: "+output.string()+".";
     if(profile.name==std::string("Experimental PE/x64 semantic match"))message="EXPERIMENTAL patch installed. Original backup: "+backup.string()+". Installed as: "+output.string()+". Review before use.";
-    if(gui)MessageBoxA(nullptr,message.c_str(),"Patch installed",MB_OK|(profile.name==std::string("Experimental PE/x64 semantic match")?MB_ICONWARNING:MB_ICONINFORMATION));else std::cout<<message<<"\n";
+    if(testSign)message+=" Test-signed with a local test certificate. Public certificate: "+publicCert.string()+". Copy the .cer to each test PC, trust it, and enable Windows test-signing mode there.";
+    if(gui)MessageBoxA(nullptr,message.c_str(),"Patch installed",MB_OK|((testSign||profile.name==std::string("Experimental PE/x64 semantic match"))?MB_ICONWARNING:MB_ICONINFORMATION));else std::cout<<message<<"\n";
     return 0;
 }
 
-enum : int { IDC_TITLE=101,IDC_SUBTITLE,IDC_ERROR,IDC_PICK_LABEL,IDC_PATH,IDC_BROWSE,IDC_PATCH_INFO,IDC_DESCRIPTION,IDC_BACKUP,IDC_STATUS,IDC_PATCH,IDC_FOOTER };
+enum : int { IDC_TITLE=101,IDC_SUBTITLE,IDC_ERROR,IDC_PICK_LABEL,IDC_PATH,IDC_BROWSE,IDC_PATCH_INFO,IDC_DESCRIPTION,IDC_BACKUP,IDC_TEST_SIGN,IDC_STATUS,IDC_PATCH,IDC_FOOTER };
 static HFONT g_font{},g_fontTitle{},g_fontBold{};
 static HBRUSH g_background{},g_header{},g_card{},g_notice{};
 static std::wstring g_selectedPath;
@@ -504,13 +644,14 @@ static LRESULT CALLBACK MainWindowProc(HWND window,UINT message,WPARAM wParam,LP
         AddButton(window,IDC_BROWSE,L"Browse...",587,203,137,36,BS_PUSHBUTTON);
         AddText(window,IDC_PATCH_INFO,L"What this patch changes",34,262,690,26);
         AddText(window,IDC_DESCRIPTION,L"This targets an Intel EPT memory issue associated with 0xC035001E. It redirects EPT page-table allocations and frees to the DLL's pool helpers.",34,294,690,54);
-        AddText(window,IDC_BACKUP,L"BACKUP  The selected original is saved with a .bak suffix. The patched DLL is installed as hyperhv.dll. Existing backups are never overwritten.",34,371,690,52);
-        AddText(window,IDC_STATUS,L"Select a DLL to begin.",34,455,440,30);
+        AddText(window,IDC_BACKUP,L"BACKUP  Original becomes hyperhv.dll.bak; patched DLL installs as hyperhv.dll. If signing an already patched DLL, its unsigned copy becomes .unsigned.bak. Existing backups are never overwritten.",34,371,690,52);
+        AddButton(window,IDC_TEST_SIGN,L"Test-sign for other PCs (exports .cer; no VS needed)",34,442,465,28,BS_AUTOCHECKBOX);
+        AddText(window,IDC_STATUS,L"Select a DLL to begin.",34,480,440,30);
         AddButton(window,IDC_PATCH,L"Patch DLL",514,446,210,48,BS_OWNERDRAW);
         AddText(window,IDC_FOOTER,L"EPT-related cause only: unrelated Hyper-V configuration errors need a different fix.",34,518,690,24);
         SetFont(window,IDC_TITLE,g_fontTitle);SetFont(window,IDC_SUBTITLE,g_font);SetFont(window,IDC_ERROR,g_fontBold);
         SetFont(window,IDC_PICK_LABEL,g_fontBold);SetFont(window,IDC_PATH,g_font);SetFont(window,IDC_BROWSE,g_font);
-        SetFont(window,IDC_PATCH_INFO,g_fontBold);SetFont(window,IDC_DESCRIPTION,g_font);SetFont(window,IDC_BACKUP,g_font);SetFont(window,IDC_STATUS,g_font);
+        SetFont(window,IDC_PATCH_INFO,g_fontBold);SetFont(window,IDC_DESCRIPTION,g_font);SetFont(window,IDC_BACKUP,g_font);SetFont(window,IDC_TEST_SIGN,g_font);SetFont(window,IDC_STATUS,g_font);
         SetFont(window,IDC_PATCH,g_fontBold);SetFont(window,IDC_FOOTER,g_font);
         EnableWindow(GetDlgItem(window,IDC_PATCH),FALSE);
         return 0;
@@ -549,7 +690,8 @@ static LRESULT CALLBACK MainWindowProc(HWND window,UINT message,WPARAM wParam,LP
             if(g_selectedPath.empty())return 0;
             EnableWindow(GetDlgItem(window,IDC_PATCH),FALSE);EnableWindow(GetDlgItem(window,IDC_BROWSE),FALSE);
             SetStatus(window,L"Checking the DLL and preparing a verified patch...");UpdateWindow(window);
-            int result=Run({g_selectedPath},true);
+            std::vector<std::wstring> runArgs;if(SendMessageW(GetDlgItem(window,IDC_TEST_SIGN),BM_GETCHECK,0,0)==BST_CHECKED)runArgs.push_back(L"--test-sign");runArgs.push_back(g_selectedPath);
+            int result=Run(runArgs,true);
             if(result==0)SetStatus(window,L"Finished. See the result message for the backup and installed file paths.");
             else SetStatus(window,L"No patch was installed. See the message for details; your original remains available.");
             EnableWindow(GetDlgItem(window,IDC_BROWSE),TRUE);EnableWindow(GetDlgItem(window,IDC_PATCH),TRUE);return 0;

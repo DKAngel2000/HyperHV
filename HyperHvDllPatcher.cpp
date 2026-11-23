@@ -562,8 +562,16 @@ static bool UndoFromBackup(const fs::path& backup,std::string& error){
     if(_wcsicmp(original.extension().c_str(),L".dll")!=0){error="The selected backup does not map to a DLL filename.";return false;}
     std::error_code ec;
     if(!fs::is_regular_file(backup,ec)||ec){error="The selected .bak file is missing or is not a regular file.";return false;}
-    if(fs::exists(original)){error="The original DLL path already exists. Nothing was changed: "+original.string();return false;}
     const fs::path deployed=backup.parent_path()/L"hyperhv.dll";
+    auto samePath=[](const fs::path& a,const fs::path& b){
+        std::error_code pathError;
+        const fs::path absA=fs::absolute(a,pathError).lexically_normal();if(pathError)return false;
+        const fs::path absB=fs::absolute(b,pathError).lexically_normal();if(pathError)return false;
+        return CompareStringOrdinal(absA.c_str(),-1,absB.c_str(),-1,TRUE)==CSTR_EQUAL;
+    };
+    if(fs::exists(original)&&(!fs::exists(deployed)||!samePath(original,deployed))){
+        error="The original DLL path already exists, and it is not the current patched DLL. Nothing was changed: "+original.string();return false;
+    }
     fs::path preserved;
     bool movedDeployed=false;
     if(fs::exists(deployed)){

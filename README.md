@@ -9,9 +9,11 @@ as hyperhv.dll. It will not overwrite an existing backup. If the DLL is already
 patched, it reports that and makes no changes unless test signing was selected.
 For an already-patched DLL, test signing saves the unsigned patched copy as
 `hyperhv.dll.unsigned.bak` before installing the signed version. The GUI's Undo
-button restores the original from its `<name>.dll.bak` file and preserves the
-currently installed patched DLL as `hyperhv.dll.patched.bak`. It will not
-overwrite either file.
+button accepts either `<name>.dll.bak` (the original) or
+`<name>.dll.unsigned.bak` (the patched but unsigned copy). It restores the
+selected version and preserves the currently installed DLL as
+`hyperhv.dll.patched.bak` or `hyperhv.dll.signed.bak`, respectively. It will not
+overwrite existing files.
 
 Command-line use:
 
@@ -37,12 +39,13 @@ boot settings or certificate trust stores. Test mode may be blocked by Secure
 Boot policy; Microsoft documents the test-signing requirements and setup at
 https://learn.microsoft.com/en-us/windows-hardware/drivers/install/the-testsigning-boot-configuration-option.
 
-To undo from the GUI, choose **Undo (select .bak)** and select the original
-backup, such as `hyperhv.dll.bak`. The original DLL is restored to its original
-filename. The installed `hyperhv.dll` is retained as `hyperhv.dll.patched.bak`.
-Command-line undo is also available:
+To undo from the GUI, choose **Undo (select backup)** and select either
+`hyperhv.dll.bak` to restore the original DLL or `hyperhv.dll.unsigned.bak` to
+restore the patched but unsigned DLL. The currently installed DLL is preserved
+as a `.patched.bak` or `.signed.bak` file. Command-line undo is also available:
 
   HyperHvDllPatcher.exe --undo hyperhv.dll.bak
+  HyperHvDllPatcher.exe --undo hyperhv.dll.unsigned.bak
 
 The scanner identifies imports, helper routines, the EPT table field at offset
 0x228, the allocator call, and exactly two matching free calls. It proceeds only

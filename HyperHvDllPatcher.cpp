@@ -552,9 +552,14 @@ static bool SignAlreadyPatched(const fs::path& input,const Bytes& bytes,fs::path
 
 static bool UndoFromBackup(const fs::path& backup,std::string& error){
     const std::wstring backupText=backup.wstring();
-    if(backupText.size()<4||_wcsicmp(backupText.c_str()+backupText.size()-4,L".bak")!=0){error="Select the original DLL backup whose name ends in .bak.";return false;}
-    const fs::path original(backupText.substr(0,backupText.size()-4));
-    if(_wcsicmp(original.extension().c_str(),L".dll")!=0){error="Select the original DLL backup (for example, hyperhv.dll.bak), not an unsigned-signing backup.";return false;}
+    const std::wstring unsignedSuffix=L".unsigned.bak";
+    const bool unsignedBackup=backupText.size()>=unsignedSuffix.size()&&_wcsicmp(backupText.c_str()+backupText.size()-unsignedSuffix.size(),unsignedSuffix.c_str())==0;
+    const size_t suffixLength=unsignedBackup?unsignedSuffix.size():4;
+    if(backupText.size()<suffixLength||(!unsignedBackup&&_wcsicmp(backupText.c_str()+backupText.size()-4,L".bak")!=0)){
+        error="Select a patcher backup ending in .dll.bak or .dll.unsigned.bak.";return false;
+    }
+    const fs::path original(backupText.substr(0,backupText.size()-suffixLength));
+    if(_wcsicmp(original.extension().c_str(),L".dll")!=0){error="The selected backup does not map to a DLL filename.";return false;}
     std::error_code ec;
     if(!fs::is_regular_file(backup,ec)||ec){error="The selected .bak file is missing or is not a regular file.";return false;}
     if(fs::exists(original)){error="The original DLL path already exists. Nothing was changed: "+original.string();return false;}
@@ -562,7 +567,7 @@ static bool UndoFromBackup(const fs::path& backup,std::string& error){
     fs::path preserved;
     bool movedDeployed=false;
     if(fs::exists(deployed)){
-        preserved=fs::path(deployed.wstring()+L".patched.bak");
+        preserved=fs::path(deployed.wstring()+(unsignedBackup?L".signed.bak":L".patched.bak"));
         if(fs::exists(preserved)){error="Cannot safely undo because the patched DLL preservation file already exists: "+preserved.string();return false;}
         if(!MoveFileExW(deployed.c_str(),preserved.c_str(),MOVEFILE_WRITE_THROUGH)){error="Could not preserve the patched DLL before undoing (Windows error "+std::to_string(GetLastError())+").";return false;}
         movedDeployed=true;
@@ -574,8 +579,8 @@ static bool UndoFromBackup(const fs::path& backup,std::string& error){
         }
         error="Could not restore the original DLL (Windows error "+std::to_string(restoreError)+"). No changes were kept.";return false;
     }
-    error="Undo complete. Original restored to: "+original.string();
-    if(movedDeployed)error+=". Patched DLL preserved at: "+preserved.string();
+    error=unsignedBackup?"Undo complete. Unsigned patched DLL restored to: ":"Undo complete. Original restored to: ";error+=original.string();
+    if(movedDeployed)error+=(unsignedBackup?". Signed DLL preserved at: ":". Patched DLL preserved at: ")+preserved.string();
     return true;
 }
 
@@ -664,8 +669,8 @@ static LRESULT CALLBACK MainWindowProc(HWND window,UINT message,WPARAM wParam,LP
         AddButton(window,IDC_BROWSE,L"Browse...",587,203,137,36,BS_PUSHBUTTON);
         AddText(window,IDC_PATCH_INFO,L"What this patch changes",34,262,690,26);
         AddText(window,IDC_DESCRIPTION,L"This targets an Intel EPT memory issue associated with 0xC035001E. It redirects EPT page-table allocations and frees to the DLL's pool helpers.",34,294,690,54);
-        AddText(window,IDC_BACKUP,L"BACKUP  Original becomes hyperhv.dll.bak. Undo restores it and keeps the patched DLL as hyperhv.dll.patched.bak. Existing backups are never overwritten.",34,371,690,52);
-        AddButton(window,IDC_UNDO,L"Undo (select .bak)",34,442,210,42,BS_PUSHBUTTON);
+        AddText(window,IDC_BACKUP,L"BACKUP  Original is saved as .dll.bak; an unsigned copy before signing is saved as .dll.unsigned.bak. Undo restores either and preserves the current DLL.",34,371,690,52);
+        AddButton(window,IDC_UNDO,L"Undo (select backup)",34,442,210,42,BS_PUSHBUTTON);
         AddButton(window,IDC_TEST_SIGN,L"Test-sign (no VS or .cer needed)",260,449,246,28,BS_AUTOCHECKBOX);
         AddText(window,IDC_STATUS,L"Select a DLL to begin, or choose Undo and select its .bak file.",34,488,690,26);
         AddButton(window,IDC_PATCH,L"Patch DLL",514,446,210,48,BS_OWNERDRAW);
@@ -707,7 +712,7 @@ static LRESULT CALLBACK MainWindowProc(HWND window,UINT message,WPARAM wParam,LP
     case WM_COMMAND:{
         const int id=LOWORD(wParam);
         if(id==IDC_BROWSE){auto path=PickDll(window);if(path){g_selectedPath=path->wstring();SetWindowTextW(GetDlgItem(window,IDC_PATH),g_selectedPath.c_str());SetStatus(window,L"Ready. The patcher will verify the DLL before changing anything.");EnableWindow(GetDlgItem(window,IDC_PATCH),TRUE);}return 0;}
-        if(id==IDC_UNDO){auto backup=PickBackup(window);if(!backup)return 0;std::string result;bool ok=UndoFromBackup(*backup,result);MessageBoxA(window,result.c_str(),ok?"Undo complete":"Undo failed",MB_OK|(ok?MB_ICONINFORMATION:MB_ICONERROR));SetStatus(window,ok?L"Original DLL restored; patched copy retained as a .patched.bak file.":L"Undo could not be completed; see the message for details.");return 0;}
+        if(id==IDC_UNDO){auto backup=PickBackup(window);if(!backup)return 0;std::string result;bool ok=UndoFromBackup(*backup,result);MessageBoxA(window,result.c_str(),ok?"Undo complete":"Undo failed",MB_OK|(ok?MB_ICONINFORMATION:MB_ICONERROR));SetStatus(window,ok?L"Selected backup restored; the previous DLL was preserved as a .bak file.":L"Undo could not be completed; see the message for details.");return 0;}
         if(id==IDC_PATCH){
             if(g_selectedPath.empty())return 0;
             EnableWindow(GetDlgItem(window,IDC_PATCH),FALSE);EnableWindow(GetDlgItem(window,IDC_BROWSE),FALSE);
